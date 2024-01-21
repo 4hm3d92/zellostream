@@ -6,7 +6,7 @@ import json
 import time
 import logging
 import pyaudio
-from numpy import frombuffer, array, repeat, short, float32
+from numpy import frombuffer, array, repeat, short, float32, pad
 import opuslib
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
@@ -278,6 +278,17 @@ def get_udp_audio(config,seconds,channel="mono"):
 		zello_data = librosa.resample(zello_data.astype(float32), orig_sr=config["audio_input_sample_rate"], target_sr=config["zello_sample_rate"]).astype(short)
 	return zello_data
 
+def read_audio_file(config,file_path):
+	try:
+		zello_data, sr = librosa.load(file_path, mono=True, dtype=float32)
+		zello_data = librosa.resample(zello_data*32767, orig_sr=sr, target_sr=config["zello_sample_rate"]).astype(short)
+		print(sr)
+		return zello_data
+
+	except Exception as ex:
+		LOG.error("Error reading audio file: %s", ex)
+		return frombuffer(b'', dtype=short)
+
 def create_zello_connection(config):
 	try:
 		ws = websocket.create_connection(config["zello_ws_url"])
@@ -510,7 +521,9 @@ def main():
 	except ConfigException as ex:
 		LOG.critical("configuration error: %s", ex)
 		sys.exit(1)
-	
+		
+	enc = create_encoder(config)	
+
 	log_level = logging.getLevelName(config["logging_level"].upper())
 	LOG.setLevel(log_level)
 	
@@ -530,10 +543,50 @@ def main():
 		udp_rx_thread = Thread(target=udp_rx,args=(UDPSock,config))
 		udp_rx_thread.start()
 		udp_buffer_lock = Lock()
+	elif config["audio_source"] == "Audio File":
+		LOG.info("start audio file read")
+		data = read_audio_file(config, "5.mp3")
+		if not zello_ws or not zello_ws.connected:
+			zello_ws = create_zello_connection(config)
+
+		if not zello_ws:
+			print("Cannot establish connection")
+			time.sleep(1)
+			return
+		zello_ws.settimeout(1)
+		stream_id = start_stream(config, zello_ws)
+		if not stream_id:
+			print("Cannot start stream")
+			time.sleep(1)
+			return
+		print("sending to stream_id " + str(stream_id))
+		packet_id = 0
+		while processing:
+			if len(data)<zello_chunk:
+				data = pad(data, (0, zello_chunk-len(data)), 'constant', constant_values=0)
+				processing = False
+			data2 = data[:zello_chunk - 1].tobytes()
+			data = data[zello_chunk:]
+			out = opuslib.api.encoder.encode(enc, data2, zello_chunk, len(data2) * 2)
+			send_data = bytearray(array([1]).astype(">u1").tobytes())
+			send_data = send_data + array([stream_id]).astype(">u4").tobytes()
+			send_data = send_data + array([packet_id]).astype(">u4").tobytes()
+			send_data = send_data + out
+			try:
+				nbytes = zello_ws.send_binary(send_data)
+				if nbytes == 0:
+					print("Binary send error")
+					break
+			except Exception as ex:
+				print(f"Zello error {ex}")
+				break
+		print("Done sending audio")
+		stop_stream(zello_ws, stream_id)
+		stream_id = None
+		
 	else:
 		LOG.warning("Invalid Audio Source")
 
-	enc = create_encoder(config)
 
 	while processing:
 		try:
